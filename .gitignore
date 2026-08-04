@@ -1,0 +1,32 @@
+# Secrets / auth
+.env
+*.env
+*.key
+*.pem
+*.p12
+*.crt
+id_rsa*
+*service_account*
+op_service_account_token*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
+
+# Claude Code local state
+.claude/plans/
+.claude/projects/
+.claude/plugins/cache/
+
+# QA / evidence / temp
+evidence/
+tmp/
+temp/
+*.log
+*.bak
+*.bak.*
