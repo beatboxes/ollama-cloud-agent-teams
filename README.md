@@ -32,17 +32,37 @@ python "$env:USERPROFILE\.claude\skills\ollama-cloud-agent-teams\scripts\ollama_
 python "$env:USERPROFILE\.claude\skills\ollama-cloud-agent-teams\scripts\ollama_cloud_delegate.py" --discover --json
 ```
 
-## Install (macOS/Linux)
+## Install (Linux/macOS)
 
 ```bash
 git clone https://github.com/beatboxes/ollama-cloud-agent-teams.git ~/.claude/skills/ollama-cloud-agent-teams
-python ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delegate.py --self-test
-python ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delegate.py --discover --json
+python3 -I ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delegate.py --self-test
+python3 -I ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delegate.py --discover --json
 ```
+
+Use `python3` (many Linux hosts have no `python`). `-I` is Python isolated mode: it ignores `PYTHONPATH` and the current directory, so a planted module cannot be imported.
+
+## Claude Code lead usage (DeepSeek flash)
+
+One-time: `ollama signin` and `ollama pull deepseek-v4.1-flash:cloud` (the daemon must be serving on `127.0.0.1:11434`). Then the lead calls:
+
+```bash
+python3 -I ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delegate.py --task <task> --role <role> --model deepseek-v4.1-flash:cloud --prompt "..." --json
+```
+
+`<task>` is one of `deep-debugging`, `security-review`, `performance-analysis`, `architecture-review`, `frontend-ui-review`, `test-plan-generation`, `log-error-clustering`, `documentation-summarization`. `<role>` is one of `debugger`, `security-reviewer`, `performance-reviewer`, `qa-planner`, `architecture-critic`, `summarizer`. Add `--dry-run` first to preview the redacted prompt with no API call. If the model is not pulled the script exits 12 and prints the `ollama pull` command. The JSON output has `response`, `response_source` (`content` or `thinking`) and `done_reason`.
+
+## Tests
+
+```bash
+cd ~/.claude/skills/ollama-cloud-agent-teams && python3 -I -m unittest discover -s tests -v
+```
+
+stdlib only, no network.
 
 ## Verify install
 
-`--self-test` should print: accept 4/4, reject 4/4, redaction 7, routing 1, EXIT 0. Then `--discover --json` should list cloud-tagged models reachable from your `OLLAMA_HOST`.
+`--self-test` should print: accept 5/5, reject 5/5, redaction 7, routing 2, EXIT 0. Then `--discover --json` should list cloud-tagged models reachable from your `OLLAMA_HOST`.
 
 ## Example debugging delegation (dry-run, no API call)
 

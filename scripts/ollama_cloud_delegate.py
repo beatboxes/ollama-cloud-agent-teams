@@ -16,12 +16,15 @@ Exit codes:
   16 PYTHON_ERROR
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -29,6 +32,7 @@ import urllib.error
 
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MAX_CONTEXT_CHARS = 100_000
+DEFAULT_OLLAMA_PORT = 11434
 EXIT_SUCCESS = 0
 EXIT_CLOUD_ONLY_VIOLATION = 10
 EXIT_AUTH_REQUIRED = 11
@@ -53,40 +57,48 @@ ROUTING_MAP = {
         "kimi-k2.6:cloud",
         "kimi-k2-thinking:cloud",
         "kimi-k2:1t-cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "security-review": [
         "glm-5.1:cloud",
         "mistral-large-3:675b-cloud",
         "deepseek-v3.2:cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "performance-analysis": [
         "deepseek-v4-pro:cloud",
         "glm-5:cloud",
         "qwen3-coder:480b-cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "architecture-review": [
         "qwen3-coder:480b-cloud",
         "devstral-2:123b-cloud",
         "kimi-k2.6:cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "frontend-ui-review": [
         "kimi-k2.6:cloud",
         "gemini-3-flash-preview:cloud",
         "gpt-oss:120b-cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "test-plan-generation": [
         "kimi-k2.6:cloud",
         "qwen3-coder-next:cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "log-error-clustering": [
         "deepseek-v3.2:cloud",
         "deepseek-v4-pro:cloud",
         "minimax-m2.7:cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
     "documentation-summarization": [
         "gemma3:4b-cloud",
         "gpt-oss:20b-cloud",
         "gemini-3-flash-preview:cloud",
+        "deepseek-v4.1-flash:cloud",
     ],
 }
 
@@ -336,7 +348,7 @@ def select_model(
 ) -> tuple[str, str]:
     """Select a cloud model. Returns (model_name, selection_reason).
     Exits with CLOUD_ONLY_VIOLATION if explicit non-cloud model supplied.
-    Exits with NO_CLOUD_MODELS if no cloud models discovered.
+    Exits with NO_CLOUD_MODELS if model is 'auto' and no cloud models discovered.
     """
     if not discovered and model_arg == "auto":
         die(
@@ -354,10 +366,12 @@ def select_model(
                 "enforced. No local-model fallback.",
             )
         if model_arg not in discovered:
-            die(
-                EXIT_NO_CLOUD_MODELS,
-                f"Model '{model_arg}' is cloud-tagged but not discovered. "
-                "Sign in via the `ollama` GUI/CLI or set OLLAMA_CLOUD_MODELS.",
+            # Cloud-tagged and explicitly named: allow it even if it is not
+            # pulled yet. The daemon answers 404 "model not found" if it is
+            # missing, which cmd_delegate maps to a `ollama pull` hint.
+            return model_arg, (
+                f"explicit --model {model_arg} (not in `ollama list` or "
+                "OLLAMA_CLOUD_MODELS; daemon will confirm)"
             )
         return model_arg, f"explicit --model {model_arg}"
 
@@ -380,12 +394,34 @@ def select_model(
 
 
 def normalize_host(host: str) -> str:
-    """Ensure host has http:// or https:// scheme. Default to http:// if missing."""
+    """Turn an OLLAMA_HOST value into a base URL usable as a client target.
+
+    Accepts bare `host`, `host:port`, `:port`, optional scheme, trailing
+    slashes and whitespace. Default http port 11434. Wildcard bind addresses
+    (0.0.0.0, [::]) are not valid connect targets, so map them to loopback.
+    """
+    host = (host or "").strip()
     if not host:
         return DEFAULT_OLLAMA_HOST
-    if host.startswith("http://") or host.startswith("https://"):
-        return host
-    return "http://" + host
+    if "://" not in host:
+        host = "http://" + host
+    try:
+        parts = urllib.parse.urlsplit(host)
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return host.rstrip("/")
+    if hostname in ("", "0.0.0.0"):
+        hostname = "127.0.0.1"
+    elif hostname == "::":
+        hostname = "::1"
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is None and scheme == "http":
+        port = DEFAULT_OLLAMA_PORT
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return f"{scheme}://{netloc}"
 
 
 def call_ollama(
@@ -419,21 +455,44 @@ def call_ollama(
             raw = resp.read().decode("utf-8", errors="replace")
             return raw, resp.status, ""
     except urllib.error.HTTPError as e:
-        return "", e.code, f"HTTP {e.code}: {e.reason}"
+        detail = ""
+        try:
+            parsed = json.loads(e.read().decode("utf-8", errors="replace"))
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                # Only the error text; never signin_url or other fields.
+                detail = ": " + parsed["error"][:300]
+        except (OSError, ValueError):
+            pass
+        return "", e.code, f"HTTP {e.code}: {e.reason}{detail}"
     except urllib.error.URLError as e:
         return "", 0, f"URL error: {e.reason}"
     except OSError as e:
         return "", 0, f"OS error: {e}"
 
 
-def extract_response_text(raw_body: str) -> str:
-    """Extract message.content from /api/chat response JSON."""
+def extract_response(raw_body: str) -> tuple[str, str]:
+    """Extract the answer from /api/chat response JSON.
+    Returns (text, source) where source is 'content', 'thinking' or ''.
+    Thinking models may leave message.content empty and put the text in
+    message.thinking; use that only when content is empty.
+    """
     try:
         parsed = json.loads(raw_body)
-        msg = parsed.get("message", {})
-        return msg.get("content", "")
-    except json.JSONDecodeError:
-        return ""
+    except (json.JSONDecodeError, TypeError):
+        return "", ""
+    msg = parsed.get("message") if isinstance(parsed, dict) else None
+    if not isinstance(msg, dict):
+        return "", ""
+    for key in ("content", "thinking"):
+        val = msg.get(key)
+        if isinstance(val, str) and val.strip():
+            return val, key
+    return "", ""
+
+
+def extract_response_text(raw_body: str) -> str:
+    """Extract the answer text from /api/chat response JSON."""
+    return extract_response(raw_body)[0]
 
 
 # --- Subcommands ------------------------------------------------------------
@@ -445,7 +504,7 @@ def cmd_discover(args) -> int:
         "discovered_cloud_models": accepted,
         "rejected_from_env": rejected_env,
         "rejected_from_cli_count": len(rejected_cli),
-        "ollama_host": os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
+        "ollama_host": normalize_host(os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)),
     }
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -472,11 +531,13 @@ def cmd_self_test(args) -> int:
         "gpt-oss:120b-cloud",
         "qwen3-coder:480b-cloud",
         "qwen3-vl:235b-instruct-cloud",
+        "deepseek-v4.1-flash:cloud",
     ]
     reject_set = [
         "llama3:8b",
         "qwen3-coder:480b",
         "deepseek-v3.2",
+        "deepseek-v4.1-flash",
         "cloud-model-without-tag",
     ]
     failures: list[str] = []
@@ -518,6 +579,11 @@ def cmd_self_test(args) -> int:
         failures.append("routing: kimi-k2.6:cloud not preferred for deep-debugging")
     else:
         print("routing: deep-debugging -> kimi-k2.6:cloud: PASS")
+
+    if "deepseek-v4.1-flash:cloud" not in ROUTING_MAP.get("log-error-clustering", []):
+        failures.append("routing: deepseek-v4.1-flash:cloud missing from log-error-clustering")
+    else:
+        print("routing: log-error-clustering -> deepseek-v4.1-flash:cloud: PASS")
 
     if failures:
         print("\n## Self-test FAILURES", file=sys.stderr)
@@ -668,14 +734,35 @@ def cmd_delegate(args) -> int:
                 f"Detail: {err}",
                 json_out,
             )
+        if status == 404 and "model" in err.lower() and "not found" in err.lower():
+            die(
+                EXIT_NO_CLOUD_MODELS,
+                f"Model '{model}' is not available on the Ollama daemon. "
+                f"Run `ollama pull {model}` (needs `ollama signin` for cloud "
+                f"models), then retry. Detail: {err}",
+                json_out,
+            )
         die(EXIT_API_ERROR, f"Ollama daemon error: {err}", json_out)
 
-    response_text = extract_response_text(raw)
+    response_text, response_source = extract_response(raw)
+    try:
+        done_reason = json.loads(raw).get("done_reason", "")
+    except (ValueError, AttributeError):
+        done_reason = ""
+    if not response_text:
+        die(
+            EXIT_API_ERROR,
+            "Ollama returned an empty response (no message.content or "
+            f"message.thinking; done_reason={done_reason!r}).",
+            json_out,
+        )
     # Re-run redaction on response as a safety net.
     response_text, response_redactions = redact(response_text)
     total_redactions += response_redactions
 
     payload["response"] = response_text
+    payload["response_source"] = response_source
+    payload["done_reason"] = done_reason
     payload["http_status"] = status
     payload["redaction_count"] = total_redactions
     payload["status"] = "ok"
@@ -751,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.prompt:
         missing.append("--prompt")
     if missing:
-        die(EXIT_BAD_ARGS, f"Missing required args: {missing}")
+        die(EXIT_BAD_ARGS, f"Missing required args: {missing}", args.json)
     return cmd_delegate(args)
 
 
