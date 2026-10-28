@@ -40,7 +40,7 @@ python3 -I ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delega
 python3 -I ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delegate.py --discover --json
 ```
 
-Use `python3` (many Linux hosts have no `python`). `-I` is Python isolated mode: it ignores `PYTHONPATH` and the current directory, so a planted module cannot be imported.
+Use `python3` (many Linux hosts have no `python`). `-I` is Python isolated mode: it ignores `PYTHON*` environment variables (such as `PYTHONPATH`) and the user site-packages, and puts neither the script's directory nor the current directory on `sys.path`, so a planted module there is not imported.
 
 ## Claude Code lead usage (DeepSeek flash)
 

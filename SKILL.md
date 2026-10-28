@@ -39,13 +39,13 @@ Model availability is conditional on local discovery. Never hardcode availabilit
 
 | Task family | Preferred cloud models (in order) |
 |---|---|
-| Deep debugging, long-horizon coding, stubborn bug analysis, large-context codebase tracing, refactor strategy, complex QA design, UI/code review | `kimi-k2.6:cloud` (1042B, 262k ctx, vision+thinking+tools) → `kimi-k2-thinking:cloud` → `kimi-k2:1t-cloud` |
-| Code-heavy architecture review, multi-file tracing | `qwen3-coder:480b-cloud` → `qwen3-coder-next:cloud` → `devstral-2:123b-cloud` → `kimi-k2.6:cloud` |
+| Deep debugging, long-horizon coding, stubborn bug analysis, large-context codebase tracing, refactor strategy, complex QA design, UI/code review | `kimi-k2.6:cloud` (1042B, 262k ctx, vision+thinking+tools) → `kimi-k2-thinking:cloud` → `kimi-k2:1t-cloud` → `deepseek-v4.1-flash:cloud` |
+| Code-heavy architecture review, multi-file tracing | `qwen3-coder:480b-cloud` → `qwen3-coder-next:cloud` → `devstral-2:123b-cloud` → `kimi-k2.6:cloud` → `deepseek-v4.1-flash:cloud` |
 | Long-context reasoning, log/error clustering | `deepseek-v3.2:cloud` → `deepseek-v4-pro:cloud` → `minimax-m2.7:cloud` → `deepseek-v4.1-flash:cloud` |
-| General reasoning, security review, performance analysis | `glm-5.1:cloud` → `mistral-large-3:675b-cloud` → `glm-5:cloud` → `deepseek-v3.2:cloud` |
+| General reasoning, security review, performance analysis | `glm-5.1:cloud` → `mistral-large-3:675b-cloud` → `glm-5:cloud` → `deepseek-v3.2:cloud` → `deepseek-v4.1-flash:cloud` |
 | Fast summarization, sanity checks, simple alternate explanations | `gemma3:4b-cloud` → `gpt-oss:20b-cloud` → `gemini-3-flash-preview:cloud` → `ministral-3:14b-cloud` → `deepseek-v4.1-flash:cloud` |
-| Frontend/UI review (vision useful) | `kimi-k2.6:cloud` → `gemini-3-flash-preview:cloud` → `gpt-oss:120b-cloud` |
-| Test-plan generation | `kimi-k2.6:cloud` → `qwen3-coder-next:cloud` |
+| Frontend/UI review (vision useful) | `kimi-k2.6:cloud` → `gemini-3-flash-preview:cloud` → `gpt-oss:120b-cloud` → `deepseek-v4.1-flash:cloud` |
+| Test-plan generation | `kimi-k2.6:cloud` → `qwen3-coder-next:cloud` → `deepseek-v4.1-flash:cloud` |
 
 ## Standard delegation workflow
 
@@ -62,7 +62,7 @@ Model availability is conditional on local discovery. Never hardcode availabilit
      --context-file <redacted-excerpt-path> \
      [--dry-run] [--json]
    ```
-   Linux/macOS: use `python3` (there is often no `python`). On Windows use `python` and backslash paths. `-I` runs Python isolated so a stray `json.py` or `PYTHONPATH` in the working directory is never imported. Example with the DeepSeek flash cloud model: `--model deepseek-v4.1-flash:cloud`. If that model is not pulled yet the script exits 12 and says to run `ollama pull deepseek-v4.1-flash:cloud` (the daemon needs `ollama signin` first). Set `OLLAMA_HOST` only if the daemon is not on `127.0.0.1:11434`; bare `host:port` and `0.0.0.0` are accepted. For thinking models the answer is taken from `message.content`, or from `message.thinking` when content is empty (JSON field `response_source` says which).
+   Linux/macOS: use `python3` (there is often no `python`). On Windows use `python` and backslash paths. `-I` runs Python in isolated mode: `PYTHON*` environment variables (such as `PYTHONPATH`) and the user site-packages are ignored, and neither the script's directory nor the current directory is put on `sys.path`, so a stray `json.py` there is not imported. Example with the DeepSeek flash cloud model: `--model deepseek-v4.1-flash:cloud`. If that model is not pulled yet the script exits 12 and says to run `ollama pull deepseek-v4.1-flash:cloud` (the daemon needs `ollama signin` first). Set `OLLAMA_HOST` only if the daemon is not on `127.0.0.1:11434`; bare `host:port` (port defaults to 11434 only when no `http(s)://` is given), `0.0.0.0` and a `/path` prefix are accepted; userinfo and non-http(s) schemes exit 15. For thinking models the answer is taken from `message.content`, or from `message.thinking` when content is empty (JSON field `response_source` says which).
 5. **Treat the result as advisory evidence, not truth.** Delegated models hallucinate. They cite file paths that do not exist. They invent APIs. Verify every claim.
 6. **Cross-check with local files, tests, and logs before any fix.** Open the file at the cited line. Run the test. Read the log line. If the model's claim does not match reality, discard the claim.
 7. **Include delegated output in evidence only if it contains no secrets.** If redaction removed secrets, the sanitized output is safe to quote. Never quote raw model output that includes unredacted secrets.
@@ -92,8 +92,8 @@ Do NOT delegate when:
 | 11 | `AUTH_REQUIRED` — Ollama Cloud auth missing or expired |
 | 12 | `NO_CLOUD_MODELS` — zero cloud-tagged models discovered, or the daemon reports the named model is not pulled |
 | 13 | `REDACTION_REFUSAL` — a context file looks secret-bearing and cannot be safely redacted |
-| 14 | `API_ERROR` — HTTP error from the Ollama daemon |
-| 15 | `BAD_ARGS` — invalid CLI arguments |
+| 14 | `API_ERROR` — HTTP error from the Ollama daemon, or an empty response (no `message.content` and no `message.thinking`) |
+| 15 | `BAD_ARGS` — invalid CLI arguments, or an unusable `OLLAMA_HOST` (userinfo before `@`, or a scheme other than http/https) |
 | 16 | `PYTHON_ERROR` — unexpected Python exception |
 
 ## References

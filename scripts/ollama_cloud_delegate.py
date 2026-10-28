@@ -19,6 +19,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -51,7 +52,9 @@ def is_cloud_tagged(model_name: str) -> bool:
     final_tag = parts[-1]
     return final_tag == "cloud" or final_tag.endswith("-cloud")
 
-# Routing map aligned with references/model-routing.md.
+# Routing map. Keep in sync with the tables in references/model-routing.md and
+# SKILL.md (the docs may also list extra tail models that auto-routing never
+# tries; this dict is what the script actually does).
 ROUTING_MAP = {
     "deep-debugging": [
         "kimi-k2.6:cloud",
@@ -393,35 +396,74 @@ def select_model(
     return "", ""  # unreachable
 
 
-def normalize_host(host: str) -> str:
+def normalize_host(host: str, json_out: bool = False) -> str:
     """Turn an OLLAMA_HOST value into a base URL usable as a client target.
 
-    Accepts bare `host`, `host:port`, `:port`, optional scheme, trailing
-    slashes and whitespace. Default http port 11434. Wildcard bind addresses
-    (0.0.0.0, [::]) are not valid connect targets, so map them to loopback.
+    Accepts bare `host`, `host:port`, `:port`, optional http/https scheme, an
+    optional path prefix, trailing slashes and whitespace. The default port
+    11434 is applied only when the value has no scheme (`host`, `:port`); an
+    explicit `http://host` keeps the scheme's own port. Wildcard bind
+    addresses (0.0.0.0, [::]) are not valid connect targets, so map them to
+    loopback. Fails closed (exit 15 BAD_ARGS) on userinfo (`user@host`), any
+    scheme other than http/https, and unparsable values.
     """
     host = (host or "").strip()
     if not host:
         return DEFAULT_OLLAMA_HOST
-    if "://" not in host:
+    had_scheme = "://" in host
+    if not had_scheme:
         host = "http://" + host
     try:
         parts = urllib.parse.urlsplit(host)
         scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            die(
+                EXIT_BAD_ARGS,
+                f"Unsupported OLLAMA_HOST scheme '{scheme}'. Only http:// and "
+                "https:// are allowed.",
+                json_out,
+            )
+        if "@" in parts.netloc:
+            die(
+                EXIT_BAD_ARGS,
+                "OLLAMA_HOST must not contain userinfo (anything before an "
+                "'@' in the host part). Use [http(s)://]host[:port][/path].",
+                json_out,
+            )
         hostname = parts.hostname or ""
         port = parts.port
     except ValueError:
-        return host.rstrip("/")
+        die(
+            EXIT_BAD_ARGS,
+            "OLLAMA_HOST is not a valid [http(s)://]host[:port][/path] value.",
+            json_out,
+        )
     if hostname in ("", "0.0.0.0"):
         hostname = "127.0.0.1"
     elif hostname == "::":
         hostname = "::1"
     if ":" in hostname:
         hostname = f"[{hostname}]"
-    if port is None and scheme == "http":
+    if port is None and not had_scheme:
         port = DEFAULT_OLLAMA_PORT
     netloc = f"{hostname}:{port}" if port is not None else hostname
-    return f"{scheme}://{netloc}"
+    return f"{scheme}://{netloc}{parts.path.rstrip('/')}"
+
+
+# Control characters (incl. ESC, NUL, DEL) in daemon-supplied text.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+ERROR_TEXT_LIMIT = 300
+
+
+def clean_daemon_text(text: str, limit: int = ERROR_TEXT_LIMIT) -> str:
+    """Make daemon-supplied error text safe to show.
+
+    Redact the whole text first (so a secret straddling the cap cannot be cut
+    into an unmatched fragment), then replace control characters with a space,
+    then cap the length.
+    """
+    redacted, _ = redact(text)
+    return _CONTROL_CHARS.sub(" ", redacted)[:limit]
 
 
 def call_ollama(
@@ -429,11 +471,13 @@ def call_ollama(
     system_prompt: str,
     user_prompt: str,
     ollama_host: str,
+    json_out: bool = False,
 ) -> tuple[str, int, str]:
     """POST /api/chat to local Ollama daemon.
     Returns (response_body, http_status, error_message).
+    Exits 15 BAD_ARGS if `ollama_host` is not an acceptable host.
     """
-    host = normalize_host(ollama_host)
+    host = normalize_host(ollama_host, json_out)
     url = host.rstrip("/") + "/api/chat"
     body = {
         "model": model,
@@ -460,8 +504,10 @@ def call_ollama(
             parsed = json.loads(e.read().decode("utf-8", errors="replace"))
             if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
                 # Only the error text; never signin_url or other fields.
-                detail = ": " + parsed["error"][:300]
-        except (OSError, ValueError):
+                detail = ": " + clean_daemon_text(parsed["error"])
+        except (OSError, ValueError, http.client.HTTPException):
+            # Unreadable or truncated (IncompleteRead) error body: keep the
+            # status line only so the caller still maps it to exit 14.
             pass
         return "", e.code, f"HTTP {e.code}: {e.reason}{detail}"
     except urllib.error.URLError as e:
@@ -504,7 +550,9 @@ def cmd_discover(args) -> int:
         "discovered_cloud_models": accepted,
         "rejected_from_env": rejected_env,
         "rejected_from_cli_count": len(rejected_cli),
-        "ollama_host": normalize_host(os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)),
+        "ollama_host": normalize_host(
+            os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST), args.json
+        ),
     }
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -724,7 +772,9 @@ def cmd_delegate(args) -> int:
 
     # Live call.
     ollama_host = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
-    raw, status, err = call_ollama(model, system_prompt, user_message, ollama_host)
+    raw, status, err = call_ollama(
+        model, system_prompt, user_message, ollama_host, json_out
+    )
     if err:
         if status in (401, 403):
             die(
