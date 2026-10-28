@@ -58,7 +58,7 @@ python3 -I ~/.claude/skills/ollama-cloud-agent-teams/scripts/ollama_cloud_delega
 cd ~/.claude/skills/ollama-cloud-agent-teams && python3 -I -m unittest discover -s tests -v
 ```
 
-stdlib only, no network.
+stdlib only, no external network: a few tests talk to a throwaway mock daemon on `127.0.0.2` (ephemeral port) and one starts a short child Python process.
 
 ## Verify install
 

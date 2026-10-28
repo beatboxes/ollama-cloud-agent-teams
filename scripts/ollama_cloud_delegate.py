@@ -52,9 +52,9 @@ def is_cloud_tagged(model_name: str) -> bool:
     final_tag = parts[-1]
     return final_tag == "cloud" or final_tag.endswith("-cloud")
 
-# Routing map. Keep in sync with the tables in references/model-routing.md and
-# SKILL.md (the docs may also list extra tail models that auto-routing never
-# tries; this dict is what the script actually does).
+# Routing map: what auto-routing really tries, in order. The tables in
+# references/model-routing.md and SKILL.md must list exactly these models in
+# this order; tests/test_round3.py fails when they drift.
 ROUTING_MAP = {
     "deep-debugging": [
         "kimi-k2.6:cloud",
@@ -396,20 +396,38 @@ def select_model(
     return "", ""  # unreachable
 
 
+# Characters that never belong in an OLLAMA_HOST value: whitespace (including
+# Unicode spaces), C0 controls (NUL, CR, LF, ESC ...), DEL and backslash. They
+# are how URL-parser differentials and line injection get smuggled in.
+_HOST_FORBIDDEN_CHARS = re.compile(r"[\s\x00-\x1f\x7f\\]")
+# The only '%' a host name may contain: an IPv6 zone id inside brackets, e.g.
+# [fe80::1%25eth0] or [fe80::1%eth0]. Matched against the lower-cased host.
+_IPV6_ZONE_HOST = re.compile(r"(?=[^%]*:)[0-9a-f:.]+%[0-9a-z._~-]+")
+
+
 def normalize_host(host: str, json_out: bool = False) -> str:
     """Turn an OLLAMA_HOST value into a base URL usable as a client target.
 
     Accepts bare `host`, `host:port`, `:port`, optional http/https scheme, an
-    optional path prefix, trailing slashes and whitespace. The default port
-    11434 is applied only when the value has no scheme (`host`, `:port`); an
-    explicit `http://host` keeps the scheme's own port. Wildcard bind
-    addresses (0.0.0.0, [::]) are not valid connect targets, so map them to
-    loopback. Fails closed (exit 15 BAD_ARGS) on userinfo (`user@host`), any
-    scheme other than http/https, and unparsable values.
+    optional path prefix, trailing slashes and surrounding whitespace. The
+    default port 11434 is applied only when the value has no scheme (`host`,
+    `:port`); an explicit `http://host` keeps the scheme's own port. Wildcard
+    bind addresses (0.0.0.0, [::]) are not valid connect targets, so map them
+    to loopback. Fails closed (exit 15 BAD_ARGS) on userinfo (`user@host`),
+    any scheme other than http/https, whitespace, control characters or
+    backslashes anywhere in the value, a '%' in the host name (except an IPv6
+    zone id inside brackets) and unparsable values.
     """
     host = (host or "").strip()
     if not host:
         return DEFAULT_OLLAMA_HOST
+    if _HOST_FORBIDDEN_CHARS.search(host):
+        die(
+            EXIT_BAD_ARGS,
+            "OLLAMA_HOST must not contain whitespace, control characters or "
+            "backslashes.",
+            json_out,
+        )
     had_scheme = "://" in host
     if not had_scheme:
         host = "http://" + host
@@ -432,6 +450,13 @@ def normalize_host(host: str, json_out: bool = False) -> str:
             )
         hostname = parts.hostname or ""
         port = parts.port
+        if "%" in hostname and not _IPV6_ZONE_HOST.fullmatch(hostname):
+            die(
+                EXIT_BAD_ARGS,
+                "OLLAMA_HOST host name must not contain '%' (only an IPv6 "
+                "zone id inside [brackets] may).",
+                json_out,
+            )
     except ValueError:
         die(
             EXIT_BAD_ARGS,
@@ -450,20 +475,31 @@ def normalize_host(host: str, json_out: bool = False) -> str:
     return f"{scheme}://{netloc}{parts.path.rstrip('/')}"
 
 
-# Control characters (incl. ESC, NUL, DEL) in daemon-supplied text.
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Control characters in daemon-supplied text: C0 controls (NUL, ESC, CR, LF
+# ...), DEL, the C1 controls U+0080-U+009F (U+009B is an 8-bit CSI), the line
+# and paragraph separators U+2028/U+2029 and the bidi embedding, override and
+# isolate controls U+202A-U+202E and U+2066-U+2069.
+_CONTROL_CHARS = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
 ERROR_TEXT_LIMIT = 300
+# Daemon text is cut to this many characters before it is scanned: the
+# redaction patterns are not linear-time on adversarial input (a long run of
+# PEM BEGIN markers) and only ERROR_TEXT_LIMIT characters are ever shown.
+ERROR_SCAN_LIMIT = 65536
 
 
 def clean_daemon_text(text: str, limit: int = ERROR_TEXT_LIMIT) -> str:
     """Make daemon-supplied error text safe to show.
 
-    Redact the whole text first (so a secret straddling the cap cannot be cut
-    into an unmatched fragment), then replace control characters with a space,
-    then cap the length.
+    Cut the input to ERROR_SCAN_LIMIT characters, replace control characters
+    with a space (so a NUL or ESC between a key and its value cannot hide a
+    secret from the redactor), redact, and cap the length last (so a secret
+    straddling the cap cannot be cut into an unmatched fragment).
     """
-    redacted, _ = redact(text)
-    return _CONTROL_CHARS.sub(" ", redacted)[:limit]
+    stripped = _CONTROL_CHARS.sub(" ", text[:ERROR_SCAN_LIMIT])
+    redacted, _ = redact(stripped)
+    return redacted[:limit]
 
 
 def call_ollama(
@@ -501,19 +537,27 @@ def call_ollama(
     except urllib.error.HTTPError as e:
         detail = ""
         try:
-            parsed = json.loads(e.read().decode("utf-8", errors="replace"))
+            body = e.read(ERROR_SCAN_LIMIT).decode("utf-8", errors="replace")
+            parsed = json.loads(body)
             if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
                 # Only the error text; never signin_url or other fields.
                 detail = ": " + clean_daemon_text(parsed["error"])
-        except (OSError, ValueError, http.client.HTTPException):
-            # Unreadable or truncated (IncompleteRead) error body: keep the
-            # status line only so the caller still maps it to exit 14.
+        except (OSError, ValueError, http.client.HTTPException, RecursionError):
+            # Unreadable, truncated (IncompleteRead), cut at the read bound or
+            # absurdly nested body: keep the status line only so the caller
+            # still maps it to exit 14.
             pass
-        return "", e.code, f"HTTP {e.code}: {e.reason}{detail}"
+        # The reason phrase comes off the daemon's status line: same treatment.
+        return "", e.code, f"HTTP {e.code}: {clean_daemon_text(str(e.reason))}{detail}"
     except urllib.error.URLError as e:
         return "", 0, f"URL error: {e.reason}"
     except OSError as e:
         return "", 0, f"OS error: {e}"
+    except (http.client.HTTPException, RecursionError) as e:
+        # IncompleteRead on a truncated 200 body, BadStatusLine from a
+        # non-HTTP listener, LineTooLong, InvalidURL ...: a daemon error (exit
+        # 14). Only the class name is reported; the text is attacker-supplied.
+        return "", 0, f"HTTP protocol error: {type(e).__name__}"
 
 
 def extract_response(raw_body: str) -> tuple[str, str]:
@@ -544,15 +588,18 @@ def extract_response_text(raw_body: str) -> str:
 # --- Subcommands ------------------------------------------------------------
 
 def cmd_discover(args) -> int:
+    # Discovery spawns `ollama list`, which inherits OLLAMA_HOST: reject an
+    # unusable value before any process is started.
+    ollama_host = normalize_host(
+        os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST), args.json
+    )
     accepted, rejected_env, rejected_cli = discover_cloud_models()
     payload = {
         "cloud_only": True,
         "discovered_cloud_models": accepted,
         "rejected_from_env": rejected_env,
         "rejected_from_cli_count": len(rejected_cli),
-        "ollama_host": normalize_host(
-            os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST), args.json
-        ),
+        "ollama_host": ollama_host,
     }
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -666,6 +713,10 @@ def cmd_delegate(args) -> int:
     # Validate prompt.
     if not args.prompt:
         die(EXIT_BAD_ARGS, "--prompt is required for delegation.", json_out)
+
+    # Discovery spawns `ollama list`, which inherits OLLAMA_HOST: reject an
+    # unusable value before any process is started (dry-run included).
+    normalize_host(os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST), json_out)
 
     # Discover models.
     discovered, rejected_env, _ = discover_cloud_models()

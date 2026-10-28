@@ -21,7 +21,7 @@ All other names are rejected with exit code 10 `CLOUD_ONLY_VIOLATION`. No local-
 | Frontend/UI review | `kimi-k2.6:cloud` (vision capable) → `gemini-3-flash-preview:cloud` → `gpt-oss:120b-cloud` → `deepseek-v4.1-flash:cloud` → any discovered cloud model with vision capability | 50k+ chars + screenshot path (script accepts image context files) | Issue list with severity (Critical/High/Med/Low), repro steps, suggested fix area. CC verifies with Playwright + chrome-devtools-mcp. |
 | Test-plan generation | `kimi-k2.6:cloud` → `qwen3-coder-next:cloud` → `deepseek-v4.1-flash:cloud` → any discovered cloud model with 100k+ ctx | 100k+ chars of feature spec, code excerpts, existing tests | Test matrix (case × condition), edge cases, coverage gaps, suggested test fixtures. CC verifies by running the generated tests. |
 | Log/error clustering | `deepseek-v3.2:cloud` → `deepseek-v4-pro:cloud` → `minimax-m2.7:cloud` → `deepseek-v4.1-flash:cloud` → any discovered cloud model with 100k+ ctx | 100k+ chars of log lines (redacted) | Cluster list with representative sample line, suspected root cause per cluster, suggested next diagnostic. CC verifies with actual logs. |
-| Documentation summarization | `gemma3:4b-cloud` → `gpt-oss:20b-cloud` → `gemini-3-flash-preview:cloud` → `ministral-3:14b-cloud` → `deepseek-v4.1-flash:cloud` → any discovered cloud model | 30k+ chars of doc text | Summary, key points, open questions, suggested follow-ups. CC verifies against source doc. |
+| Documentation summarization | `gemma3:4b-cloud` → `gpt-oss:20b-cloud` → `gemini-3-flash-preview:cloud` → `deepseek-v4.1-flash:cloud` → any discovered cloud model | 30k+ chars of doc text | Summary, key points, open questions, suggested follow-ups. CC verifies against source doc. |
 
 ## Selection rules
 
@@ -34,7 +34,7 @@ All other names are rejected with exit code 10 `CLOUD_ONLY_VIOLATION`. No local-
 
 - The script caps context at `--max-context-chars` (default 100000). Increase only if the model's discovered context length supports it.
 - For models with 200k+ ctx (kimi-k2.6, kimi-k2:1t, deepseek-v3.2, qwen3-coder:480b), 200k chars is safe.
-- For smaller-context models (gemma3:4b, ministral-3:14b), keep context under 30k chars.
+- For smaller-context models (for example gemma3:4b), keep context under 30k chars.
 - The script does not auto-adjust context size based on model — the caller must pass `--max-context-chars` appropriately.
 
 ## Verification expectations
